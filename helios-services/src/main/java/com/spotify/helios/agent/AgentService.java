@@ -23,6 +23,7 @@ package com.spotify.helios.agent;
 
 import com.google.common.base.Suppliers;
 import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableList;
 import com.google.common.io.Resources;
 import com.google.common.util.concurrent.AbstractIdleService;
 
@@ -52,6 +53,7 @@ import com.sun.management.OperatingSystemMXBean;
 import com.yammer.dropwizard.config.ConfigurationException;
 import com.yammer.dropwizard.config.Environment;
 import com.yammer.dropwizard.config.ServerFactory;
+import com.yammer.dropwizard.lifecycle.Managed;
 import com.yammer.dropwizard.lifecycle.ServerLifecycleListener;
 import com.yammer.metrics.core.MetricsRegistry;
 
@@ -62,12 +64,16 @@ import org.eclipse.jetty.server.Server;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import sun.misc.Signal;
+import sun.misc.SignalHandler;
+
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -82,7 +88,7 @@ import static java.nio.file.StandardOpenOption.WRITE;
 /**
  * The Helios agent.
  */
-public class AgentService extends AbstractIdleService {
+public class AgentService extends AbstractIdleService implements Managed {
 
   private static final Logger log = LoggerFactory.getLogger(AgentService.class);
 
@@ -264,6 +270,8 @@ public class AgentService extends AbstractIdleService {
     } else {
       this.server = null;
     }
+
+    environment.manage(this);
   }
 
   /**
@@ -324,22 +332,44 @@ public class AgentService extends AbstractIdleService {
 
   @Override
   protected void shutDown() throws Exception {
-    if (server != null) {
+    // install sighandler so if it gets stuck below, you can still kill it
+    final SignalHandler handler = new SignalHandler() {
+      @Override
+      public void handle(Signal dontCare) {
+        // Really exit
+        Runtime.getRuntime().halt(0);
+      }
+    };
+    Signal.handle(new Signal("INT"), handler);
+    Signal.handle(new Signal("TERM"), handler);
+
+    log.info("Shutting Down");
+
+    if (server != null && !server.isStopping()) {
       server.stop();
-      server.join();
     }
-    hostInfoReporter.stopAsync().awaitTerminated();
-    agentInfoReporter.stopAsync().awaitTerminated();
-    environmentVariableReporter.stopAsync().awaitTerminated();
-    agent.stopAsync().awaitTerminated();
+
+    final List<AbstractIdleService> shutdownServices = ImmutableList.of(hostInfoReporter,
+        agentInfoReporter, environmentVariableReporter, agent, zkRegistrar, model);
+    for (AbstractIdleService subService : shutdownServices) {
+      log.info("shutting down " + subService);
+      subService.stopAsync();
+    }
+    for (AbstractIdleService subService : shutdownServices) {
+      log.info("awaiting termination " + subService);
+      subService.awaitTerminated();
+    }
+
     if (serviceRegistrar != null) {
+      log.info("closing service registrar");
       serviceRegistrar.close();
     }
-    zkRegistrar.stopAsync().awaitTerminated();
-    model.stopAsync().awaitTerminated();
+    log.info("stopping metrics");
     metrics.stop();
+    log.info("stopping zk client");
     zooKeeperClient.close();
     try {
+      log.info("releasing persistent state lock");
       stateLock.release();
     } catch (IOException e) {
       log.error("Failed to release state lock", e);
@@ -350,5 +380,13 @@ public class AgentService extends AbstractIdleService {
       log.error("Failed to close state lock file", e);
     }
   }
-}
 
+  @Override
+  public void start() throws Exception {
+  }
+
+  @Override
+  public void stop() throws Exception {
+    shutDown();
+  }
+}

@@ -66,11 +66,25 @@ public class AgentMain extends ServiceMain {
   }
 
   public static void main(final String... args) {
+    AgentMain main;
     try {
-      final AgentMain main = new AgentMain(args);
+      main = new AgentMain(args);
+    } catch (ArgumentParserException e) {
+      e.printStackTrace();
+      System.exit(1);
+      return; // never get here, but this lets java know for sure we won't continue
+    }
+    try {
       main.startAsync().awaitRunning();
       main.awaitTerminated();
     } catch (Throwable e) {
+      try {
+        main.shutDown();
+      } catch (Exception e1) {
+        System.err.println("Error shutting down");
+        e1.printStackTrace();
+        System.err.println("Originating exception follows");
+      }
       e.printStackTrace();
       System.exit(1);
     }
